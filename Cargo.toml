@@ -1,0 +1,22 @@
+[package]
+name = "nat"
+version = "0.1.0"
+authors = ["Qian Linfeng <thewawar@gmail.com>"]
+
+[dependencies]
+bytes = "^0.4.9"
+log = "^0.4.3"
+failure = "^0.1.2"
+futures = "^0.1.23"
+tokio = "^0.1.7"
+serde = "^1.0.71"
+serde_derive = "^1.0.71"
+secp256k1 = "^0.10.0"
+bincode = "^1.0.1"
+get_if_addrs = "^0.5.3"
+net2 = "^0.2.33"
+igd = "^0.7.0"
+rustun = "^0.1.5"
+
+[dev-dependencies]
+clap = "^2.32.0"
