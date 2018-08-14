@@ -1,4 +1,3 @@
-
 extern crate bytes;
 #[macro_use]
 extern crate log;
@@ -29,6 +28,11 @@ use futures::{
     Future,
     Stream,
     Sink,
+    future::{
+        self,
+        loop_fn,
+        Loop,
+    },
 };
 use tokio::io as async_io;
 // use tokio_timer::Deadline;
@@ -59,7 +63,7 @@ use secp256k1::{Secp256k1, SecretKey, PublicKey, Message, Signature};
 mod error;
 mod addr;
 
-use error::RendezvousError;
+use error::{RendezvousError, map_error};
 use addr::{SocketAddrExt, filter_addrs};
 
 lazy_static! {
@@ -68,7 +72,7 @@ lazy_static! {
 
 type RendezvousNonce = [u8; 32];
 type BoxFuture<I, E> = Box<Future<Item = I, Error = E>>;
-type BoxStream<I, E> = Box<Stream<Item = I, Error = E>>;
+// type BoxStream<I, E> = Box<Stream<Item = I, Error = E>>;
 
 /// Extensions methods for `TcpBuilder`.
 pub trait TcpBuilderExt {
@@ -107,8 +111,34 @@ impl TcpBuilderExt for TcpBuilder {
     }
 }
 
+/// Extension methods for `TcpListener`.
+pub trait TcpListenerExt {
+    /// Bind reusably to the given address. Multiple sockets can be bound to the same local address
+    /// using this method.
+    fn bind_reusable(addr: &SocketAddr, handle: &Handle) -> io::Result<TcpListener>;
+    /// Returns all local addresses of this socket, expanding an unspecified address (eg `0.0.0.0`)
+    /// into a vector of addresses, one for each network interface.
+    fn expanded_local_addrs(&self) -> io::Result<Vec<SocketAddr>>;
+}
+
+impl TcpListenerExt for TcpListener {
+    fn bind_reusable(addr: &SocketAddr, handle: &Handle) -> io::Result<TcpListener> {
+        let builder = TcpBuilder::bind_reusable(addr)?;
+        let bind_addr = builder.local_addr()?;
+        let listener = builder.listen(1024)?;
+        let listener = TcpListener::from_listener(listener, &bind_addr, handle)?;
+        Ok(listener)
+    }
+
+    fn expanded_local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        let addr = self.local_addr()?;
+        let addrs = addr.expand_local_unspecified()?;
+        Ok(addrs)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct RendezvousMsg {
+struct RendezvousMsg {
     pubkey: PublicKey,
     /// 256bit random data
     nonce: RendezvousNonce,
@@ -116,33 +146,19 @@ pub struct RendezvousMsg {
     rendezvous_addr: Option<SocketAddr>,
 }
 
-// pub struct TcpRendezvousConnect {
-//     inner: BoxFuture<TcpStream, RendezvousError>,
-// }
-
-// impl Future for TcpRendezvousConnect {
-//     type Item = TcpStream;
-//     type Error = RendezvousError;
-
-//     fn poll(
-//         &mut self,
-//     ) -> Result<Async<TcpStream>, Self::Error> {
-//         self.inner.poll()
-//     }
-// }
-
+#[derive(Debug)]
 pub struct RendezvousConfig {
     // pub tcp_addr_querier_set: TcpAddrQuerierSet,
     // pub udp_addr_querier_set: UdpAddrQuerierSet,
     // pub igd_disabled: bool,
     // pub igd_disabled_for_rendezvous: bool,
     // pub force_use_local_port: bool,
-    pub traversal_server: SocketAddr,
+    pub stun_server: SocketAddr,
     pub our_privkey: SecretKey,
     pub their_pubkey: PublicKey,
 }
 
-pub trait RendezvousTcpStream {
+pub trait TcpStreamExt {
     /// Connect to `addr` using a reusably-bound socket, bound to `bind_addr`. This can be used to
     /// create multiple TCP connections with the same local address, or with the same local address
     /// as a reusably-bound `TcpListener`.
@@ -166,18 +182,24 @@ pub trait RendezvousTcpStream {
         C: 'static;
 }
 
-impl RendezvousTcpStream for TcpStream {
+impl TcpStreamExt for TcpStream {
 
     fn connect_reusable(
         bind_addr: &SocketAddr,
         addr: &SocketAddr,
         handle: &Handle,
     ) -> BoxFuture<TcpStream, RendezvousError> {
+        debug!("Binding reusable: in {:?} for {:?}", bind_addr, addr);
         let stream = TcpBuilder::bind_reusable(bind_addr)
             .unwrap()
             .to_tcp_stream()
             .unwrap();
+        let the_addr = addr.clone();
         let fut = TcpStream::connect_stream(stream, addr, handle)
+            .map_err(move |err| {
+                debug!("connect stream error: addr={:?}, error={:?}", the_addr, err);
+                err
+            })
             .map_err(map_error);
         Box::new(fut) as BoxFuture<_, _>
     }
@@ -195,19 +217,18 @@ impl RendezvousTcpStream for TcpStream {
         C: 'static
     {
         let handle_clone = handle.clone();
-        let listener = TcpListener::bind(&"0.0.0.0:0".parse().unwrap(), handle)
+        let listener = TcpListener::bind_reusable(&"0.0.0.0:0".parse().unwrap(), handle)
             .unwrap();
         let bind_addr = listener.local_addr().unwrap();
-        let our_addrs = listener.local_addr()
-            .unwrap()
-            .expand_local_unspecified()
-            .unwrap();
+        let our_addrs = listener.expanded_local_addrs().unwrap();
         trace!("getting rendezvous address");
         let bind_addr_v4 = match bind_addr {
             SocketAddr::V4(v) => v,
             _ => panic!("IPv6 not supported!")
         };
         let our_privkey = config.our_privkey.clone();
+        let stun_server = config.stun_server.clone();
+
         let fut = search_gateway(handle)
             .map_err(map_error)
             .and_then(move |gateway| {
@@ -216,11 +237,9 @@ impl RendezvousTcpStream for TcpStream {
                     .map(|addr| Some(SocketAddr::V4(addr)))
                     .map_err(map_error)
             })
-            .or_else(|err| {
-                // FIXME: not working now
+            .or_else(move |err| {
                 trace!("get igd address error: {:?}", err);
-                let server = "127.0.0.1:5567".parse::<SocketAddr>().unwrap();
-                let addr = public_addr_from_stun(server).get(0).cloned();
+                let addr = public_addr_from_stun(stun_server).get(0).cloned();
                 Ok(addr)
             })
             .and_then(move |addr| {
@@ -241,8 +260,13 @@ impl RendezvousTcpStream for TcpStream {
                     .map_err(map_error)
                     .and_then(move |channel| {
                         channel
+                            .map_err(|err| {
+                                debug!("Receive rendezvous message error: {:?}", err);
+                                err
+                            })
                             .and_then(|msg_bytes| {
                                 let msg: RendezvousMsg = bincode::deserialize(&msg_bytes).unwrap();
+                                debug!("Receive rendezvous message: {:?}", msg);
                                 Ok(msg)
                             })
                             .into_future()
@@ -252,101 +276,119 @@ impl RendezvousTcpStream for TcpStream {
                     .and_then(move |RendezvousMsg{pubkey, nonce, open_addrs, rendezvous_addr}| {
                         let their_addrs_set: HashSet<_> = open_addrs.into_iter().collect();
                         let our_addrs_set: HashSet<_> = our_addrs.iter().cloned().collect();
-                        let mut their_addrs = filter_addrs(&our_addrs_set, &their_addrs_set);
+                        let mut their_addrs: HashSet<_> = filter_addrs(&our_addrs_set, &their_addrs_set);
                         if let Some(rendezvous_addr) = rendezvous_addr {
                             let _ = their_addrs.insert(rendezvous_addr);
                         }
                         trace!("their_addrs == {:?}", their_addrs);
+
+                        let their_nonce = nonce;
+                        let their_pubkey = pubkey;
+                        let signed_data: [u8; 64] = bincode::serialize(&their_nonce)
+                            .map(|data| Message::from_slice(&data).unwrap())
+                            .map(|msg| SECP256K1.sign(&msg, &our_privkey))
+                            .map(|sign| sign.serialize_compact(&SECP256K1))
+                            .unwrap();
+
                         let connectors = their_addrs
                             .into_iter()
-                            .map(|addr| {
-                                TcpStream::connect_reusable(&bind_addr, &addr, &handle_clone)
-                            })
+                            .map(|addr| TcpStream::connect_reusable(&bind_addr, &addr, &handle_clone))
                             .collect::<Vec<_>>();
+                        // TODO: Should have deadline
                         let incoming = listener
                             .incoming()
                             .map(|(stream, _addr)| stream)
                             .map_err(map_error);
-                        // let incoming = Deadline::new(incoming, Instant::now() + Duration::from_secs(3));
-                        let all_incoming = stream::futures_unordered(connectors)
-                            .select(incoming);
-                        choose_connections(
-                            Box::new(all_incoming) as BoxStream<_, _>,
-                            &our_privkey,
-                            &our_pubkey,
-                            &our_nonce,
-                            &pubkey,
-                            &nonce,
-                        )
+
+                        let tcp_streams = stream::futures_unordered(connectors)
+                            .select(incoming)
+                            .and_then(move |stream| {
+                                trace!(
+                                    "Handshake message from {:?} to {:?}",
+                                    stream.local_addr(),
+                                    stream.peer_addr()
+                                );
+                                // TODO: Should have deadline
+                                let data = signed_data.to_vec();
+                                debug!("Send data(len={}): {:?}", data.len(), data);
+                                async_io::write_all(stream, data)
+                                    .and_then(|(stream, _)| async_io::flush(stream))
+                                    .map_err(map_error)
+                            })
+                            .and_then(move |stream| {
+                                debug!("Handshake message sent");
+                                // TODO: Should have deadline
+                                let buf = vec![0u8; 64];
+                                async_io::read_exact(stream, buf)
+                                    .map_err(|err| {
+                                        debug!("Read from stream error: {:?}", err);
+                                        err
+                                    })
+                                    .map_err(map_error)
+                                    .and_then(move |(stream, signed_data): (TcpStream, Vec<u8>)| {
+                                        debug!("Receive handshake message from {:?}", stream.peer_addr());
+                                        Signature::from_compact(&SECP256K1, &signed_data)
+                                            .map_err(map_error)
+                                            .and_then(move |sign| {
+                                                let data = bincode::serialize(&our_nonce).unwrap();
+                                                let msg = Message::from_slice(&data).unwrap();
+                                                SECP256K1.verify(&msg, &sign, &their_pubkey)
+                                                    .map_err(map_error)
+                                            })
+                                            .map(|_| stream)
+                                    })
+                            });
+                        let fut = loop_fn(tcp_streams, |streams| {
+                            streams
+                                .into_future()
+                                .then(|res| {
+                                    match res {
+                                        Ok((stream_opt, streams)) => {
+                                            stream_opt
+                                                .map(|stream| {
+                                                    let fut = future::ok(Loop::Break(stream));
+                                                    Box::new(fut) as BoxFuture<_, _>
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    warn!("No more stream ???");
+                                                    let fut = future::ok(Loop::Continue(streams));
+                                                    Box::new(fut) as BoxFuture<_, _>
+                                                })
+                                        }
+                                        Err((err, streams)) => {
+                                            warn!("TCP streams error: {:?}", err);
+                                            let fut = future::ok(Loop::Continue(streams));
+                                            Box::new(fut) as BoxFuture<_, _>
+                                        }
+                                    }
+                                })
+                        });
+                        Box::new(fut) as BoxFuture<_, RendezvousError>
                     })
             });
         Box::new(fut) as BoxFuture<_, _>
     }
 }
 
-
-fn choose_connections(
-    all_incoming: BoxStream<TcpStream, RendezvousError>,
-    our_privkey: &SecretKey,
-    our_pubkey: &PublicKey,
-    our_nonce: &RendezvousNonce,
-    their_pubkey: &PublicKey,
-    their_nonce: &RendezvousNonce,
-) -> BoxFuture<TcpStream, RendezvousError> {
-    let signed_data: [u8; 64] = bincode::serialize(their_nonce)
-        .map(|data| Message::from_slice(&data).unwrap())
-        .map(|msg| SECP256K1.sign(&msg, &our_privkey))
-        .map(|sign| sign.serialize_compact(&SECP256K1))
-        .unwrap();
-
-    let our_pubkey = our_pubkey.clone();
-    let our_nonce = our_nonce.clone();
-    let their_pubkey = their_pubkey.clone();
-    let fut = all_incoming
-        .and_then(move |stream| {
-            trace!(
-                "sending choose from {:?} to {:?}",
-                stream.local_addr(),
-                stream.peer_addr()
-            );
-            if our_pubkey > their_pubkey {
-                // TODO: Should have deadline
-                let fut = async_io::write_all(stream, signed_data.to_vec())
-                    .and_then(|(stream, _)| async_io::flush(stream))
-                    .map_err(map_error);
-                Box::new(fut) as BoxFuture<_, _>
-            } else {
-                // TODO: Should have deadline
-                let buf = vec![0u8; 64];
-                let fut = async_io::read_exact(stream, buf)
-                    .map_err(map_error)
-                    .and_then(move |(stream, signed_data): (TcpStream, Vec<u8>)| {
-                        Signature::from_compact(&SECP256K1, &signed_data)
-                            .map_err(map_error)
-                            .and_then(move |sign| {
-                                let data = bincode::serialize(&our_nonce).unwrap();
-                                let msg = Message::from_slice(&data).unwrap();
-                                SECP256K1.verify(&msg, &sign, &their_pubkey)
-                                    .map_err(map_error)
-                            })
-                            .map(|_| stream)
-                    });
-                Box::new(fut) as BoxFuture<_, _>
-            }
-        })
-        .then(|v: Result<TcpStream, RendezvousError>| v)
-        .into_future()
-        .map(|(stream_opt, _)| stream_opt.unwrap())
-        .map_err(|(err, _)| err);
-    Box::new(fut) as BoxFuture<_, _>
-}
-
 fn public_addr_from_stun(server: SocketAddr) -> Vec<SocketAddr> {
+    debug!("Connecting to STUN server: {:?}", server);
     let mut executor = InPlaceExecutor::new().unwrap();
     let mut client = UdpClient::new(&executor.handle(), server);
     let request = rfc5389::methods::Binding.request::<rfc5389::Attribute>();
     let monitor = executor.spawn_monitor(client.call(request));
-    match executor.run_fiber(monitor).unwrap().unwrap() {
+
+    match executor.run_fiber(monitor)
+        .map_err(|err| {
+            warn!("STUN error: {:?}", err);
+            err
+        })
+        .unwrap()
+        .map_err(|err| {
+            warn!("STUN error: {:?}", err);
+            err
+        })
+        .unwrap()
+    {
         Ok(resp) => {
             debug!("OK: {:?}", resp);
             resp
@@ -368,13 +410,3 @@ fn public_addr_from_stun(server: SocketAddr) -> Vec<SocketAddr> {
         },
     }
 }
-
-fn map_error<E: fmt::Debug>(e: E) -> RendezvousError {
-    RendezvousError::Any(format!("{:?}", e))
-}
-
-// pub fn rendezvous_addr(
-// )
-//     -> Box<Future<SocketAddr, RendezvousError>>
-// {
-// }

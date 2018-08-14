@@ -27,3 +27,4 @@ rand = "^0.5.5"
 [dev-dependencies]
 clap = "^2.32.0"
 tokio-io = "^0.1.7"
+env_logger = "^0.5.12"
