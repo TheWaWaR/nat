@@ -182,6 +182,7 @@ pub trait TcpStreamExt {
         C: 'static;
 }
 
+// FIXME: remove all those `unwrap()`
 impl TcpStreamExt for TcpStream {
 
     fn connect_reusable(
@@ -224,7 +225,7 @@ impl TcpStreamExt for TcpStream {
         trace!("getting rendezvous address");
         let bind_addr_v4 = match bind_addr {
             SocketAddr::V4(v) => v,
-            _ => panic!("IPv6 not supported!")
+            _ => unreachable!()
         };
         let our_privkey = config.our_privkey.clone();
         let stun_server = config.stun_server.clone();
@@ -259,8 +260,10 @@ impl TcpStreamExt for TcpStream {
                     .send(msg_bytes)
                     .map_err(map_error)
                     .and_then(move |channel| {
+                        debug!("Sent rendezvous message");
                         channel
                             .map_err(|err| {
+                                // FIXME: FrameTooBig Error
                                 debug!("Receive rendezvous message error: {:?}", err);
                                 err
                             })
@@ -294,7 +297,7 @@ impl TcpStreamExt for TcpStream {
                             .into_iter()
                             .map(|addr| TcpStream::connect_reusable(&bind_addr, &addr, &handle_clone))
                             .collect::<Vec<_>>();
-                        // TODO: Should have deadline
+                        // FIXME: Should have deadline
                         let incoming = listener
                             .incoming()
                             .map(|(stream, _addr)| stream)
@@ -308,7 +311,7 @@ impl TcpStreamExt for TcpStream {
                                     stream.local_addr(),
                                     stream.peer_addr()
                                 );
-                                // TODO: Should have deadline
+                                // FIXME: Should have deadline
                                 let data = signed_data.to_vec();
                                 debug!("Send data(len={}): {:?}", data.len(), data);
                                 async_io::write_all(stream, data)
@@ -317,7 +320,7 @@ impl TcpStreamExt for TcpStream {
                             })
                             .and_then(move |stream| {
                                 debug!("Handshake message sent");
-                                // TODO: Should have deadline
+                                // FIXME: Should have deadline
                                 let buf = vec![0u8; 64];
                                 async_io::read_exact(stream, buf)
                                     .map_err(|err| {
@@ -356,6 +359,7 @@ impl TcpStreamExt for TcpStream {
                                                 })
                                         }
                                         Err((err, streams)) => {
+                                            // FIXME: remove this addres from the state
                                             warn!("TCP streams error: {:?}", err);
                                             let fut = future::ok(Loop::Continue(streams));
                                             Box::new(fut) as BoxFuture<_, _>
@@ -363,13 +367,14 @@ impl TcpStreamExt for TcpStream {
                                     }
                                 })
                         });
-                        Box::new(fut) as BoxFuture<_, RendezvousError>
+                        Box::new(fut) as BoxFuture<_, _>
                     })
             });
         Box::new(fut) as BoxFuture<_, _>
     }
 }
 
+// FIXME: return a tokio based future
 fn public_addr_from_stun(server: SocketAddr) -> Vec<SocketAddr> {
     debug!("Connecting to STUN server: {:?}", server);
     let mut executor = InPlaceExecutor::new().unwrap();
