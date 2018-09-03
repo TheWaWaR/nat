@@ -1,2 +1,2 @@
-pub mod socket;
 mod hole_punching;
+pub mod socket;

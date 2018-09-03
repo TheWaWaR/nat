@@ -1,14 +1,7 @@
-use std::io;
-use std::collections::HashSet;
-use std::net::{
-    SocketAddr,
-    SocketAddrV4,
-    SocketAddrV6,
-    IpAddr,
-    Ipv4Addr,
-    Ipv6Addr,
-};
 use get_if_addrs::{self, IfAddr};
+use std::collections::HashSet;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// Some helpful additional methods for `SocketAddr`.
 pub trait SocketAddrExt {

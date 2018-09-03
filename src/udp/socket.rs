@@ -1,64 +1,44 @@
-use futures::{
-    stream,
-    Future,
-    Stream,
-    Async,
-    Sink,
-    IntoFuture,
-    future::{
-        self,
-        loop_fn,
-        Loop,
-    },
-    stream::futures_unordered::FuturesUnordered,
-};
-use tokio::io as async_io;
-use tokio_core::{
-    reactor::Handle,
-    net::{
-        TcpStream,
-        TcpListener,
-        UdpSocket,
-    },
-};
-use tokio_shared_udp_socket::{
-    SharedUdpSocket,
-    WithAddress
-};
-use net2::UdpBuilder;
+use bincode;
 use bytes::Bytes;
-use std::io;
-use std::fmt;
-use std::net::SocketAddr;
-use std::collections::HashSet;
-use igd::{
-    PortMappingProtocol,
-    tokio::search_gateway,
+use futures::{
+    future::{self, loop_fn, Loop},
+    stream,
+    stream::futures_unordered::FuturesUnordered,
+    Async, Future, IntoFuture, Sink, Stream,
 };
+use igd::{tokio::search_gateway, PortMappingProtocol};
+use net2::UdpBuilder;
+use rand;
 use rustun::client::UdpClient;
 use rustun::rfc5389;
-use secp256k1::{Secp256k1, SecretKey, PublicKey, Message, Signature};
-use rand;
-use bincode;
-
-use error::{RendezvousError, map_error};
-use addr::{SocketAddrExt, IpAddrExt, filter_addrs};
-use util::{
-    SECP256K1,
-    BoxFuture,
-    BoxStream,
-    RendezvousNonce,
-    UdpRendezvousMsg,
-    RendezvousConfig,
-    public_addr_from_stun,
+use secp256k1::{Message, PublicKey, Secp256k1, SecretKey, Signature};
+use std::collections::HashSet;
+use std::fmt;
+use std::io;
+use std::net::SocketAddr;
+use tokio::io as async_io;
+use tokio_core::{
+    net::{TcpListener, TcpStream, UdpSocket},
+    reactor::Handle,
 };
+use tokio_shared_udp_socket::{SharedUdpSocket, WithAddress};
+
 use super::hole_punching::HolePunching;
+use addr::{filter_addrs, IpAddrExt, SocketAddrExt};
+use error::{map_error, RendezvousError};
+use util::{
+    public_addr_from_stun, BoxFuture, BoxStream, RendezvousConfig, RendezvousNonce, SECP256K1,
+    UdpRendezvousMsg,
+};
 
-pub trait UdpStreamExt {
-
+pub trait UdpSocketExt {
     /// Bind reusably to the given address. This method can be used to create multiple UDP sockets
     /// bound to the same local address.
-    fn bind_reusable(addr: &SocketAddr, handle: &Handle, remote_addr: Option<&SocketAddr>) -> io::Result<UdpSocket>;
+    fn bind_reusable(
+        addr: &SocketAddr,
+        handle: &Handle,
+        remote_addr: Option<&SocketAddr>,
+    ) -> io::Result<UdpSocket>;
 
     /// Returns a list of local addresses this socket is bind to.
     fn expanded_local_addrs(&self) -> io::Result<Vec<SocketAddr>>;
@@ -74,20 +54,25 @@ pub trait UdpStreamExt {
     /// Perform a UDP rendezvous connection to another peer. Both peers must call this
     /// simultaneously and `channel` must provide a channel through which the peers can communicate
     /// out-of-band.
-    fn rendezvous_connect<C>(channel: C, handle: &Handle, config: &RendezvousConfig)
-                          -> BoxFuture<(UdpSocket, SocketAddr), RendezvousError>
+    fn rendezvous_connect<C>(
+        channel: C,
+        handle: &Handle,
+        config: &RendezvousConfig,
+    ) -> BoxFuture<(UdpSocket, SocketAddr), RendezvousError>
     where
         C: Stream<Item = Bytes>,
         C: Sink<SinkItem = Bytes>,
-    <C as Stream>::Error: fmt::Debug,
-    <C as Sink>::SinkError: fmt::Debug,
+        <C as Stream>::Error: fmt::Debug,
+        <C as Sink>::SinkError: fmt::Debug,
         C: 'static;
 }
 
-impl UdpStreamExt for UdpSocket {
-
-    fn bind_reusable(addr: &SocketAddr, handle: &Handle, remote_addr: Option<&SocketAddr>) -> io::Result<UdpSocket>
-    {
+impl UdpSocketExt for UdpSocket {
+    fn bind_reusable(
+        addr: &SocketAddr,
+        handle: &Handle,
+        remote_addr: Option<&SocketAddr>,
+    ) -> io::Result<UdpSocket> {
         use std::net::IpAddr;
         let socket = match addr.ip() {
             IpAddr::V4(..) => UdpBuilder::new_v4()?,
@@ -109,18 +94,15 @@ impl UdpStreamExt for UdpSocket {
         UdpSocket::from_socket(socket, handle)
     }
 
-    fn expanded_local_addrs(&self) -> io::Result<Vec<SocketAddr>>
-    {
-        self.local_addr()?
-            .expand_local_unspecified()
+    fn expanded_local_addrs(&self) -> io::Result<Vec<SocketAddr>> {
+        self.local_addr()?.expand_local_unspecified()
     }
 
     fn bind_public(
         addr: &SocketAddr,
         handle: &Handle,
         config: &RendezvousConfig,
-    ) -> BoxFuture<(UdpSocket, SocketAddr, SocketAddr), RendezvousError>
-    {
+    ) -> BoxFuture<(UdpSocket, SocketAddr, SocketAddr), RendezvousError> {
         let handle = handle.clone();
         let stun_server = config.stun_server.clone();
 
@@ -129,47 +111,47 @@ impl UdpStreamExt for UdpSocket {
                 .map_err(map_error)
                 .and_then(|socket| {
                     // Get local address of the socket
-                    socket.local_addr()
+                    socket
+                        .local_addr()
                         .map_err(map_error)
                         .map(move |bind_addr| (socket, bind_addr))
-                })
+                }),
         );
 
-        let fut = bind_fut
-            .and_then(move |(socket, bind_addr)| {
-                // Get public address (IpAddrExt::is_global())
-                let public_addr_fut = future::result(
-                    bind_addr
-                        .expand_local_unspecified()
-                        .map_err(map_error)
-                        .and_then(move |addrs| {
-                            addrs
-                                .into_iter()
-                                .find(|addr| IpAddrExt::is_global(&addr.ip()))
-                                .ok_or_else(|| RendezvousError::Any("can not find global ip".to_string()))
-                        })
-                );
+        let fut = bind_fut.and_then(move |(socket, bind_addr)| {
+            // Get public address (IpAddrExt::is_global())
+            let public_addr_fut = future::result(
+                bind_addr
+                    .expand_local_unspecified()
+                    .map_err(map_error)
+                    .and_then(move |addrs| {
+                        addrs
+                            .into_iter()
+                            .find(|addr| IpAddrExt::is_global(&addr.ip()))
+                            .ok_or_else(|| {
+                                RendezvousError::Any("can not find global ip".to_string())
+                            })
+                    }),
+            );
 
-                public_addr_fut
-                    .or_else(move |err| {
-                        rendezvous_addr(&handle, bind_addr, stun_server)
-                    })
-                    .map(move |public_addr| (socket, bind_addr, public_addr))
-            });
+            public_addr_fut
+                .or_else(move |err| rendezvous_addr(&handle, bind_addr, stun_server))
+                .map(move |public_addr| (socket, bind_addr, public_addr))
+        });
         Box::new(fut) as BoxFuture<_, _>
     }
 
     fn rendezvous_connect<C>(
         channel: C,
         handle: &Handle,
-        config: &RendezvousConfig
+        config: &RendezvousConfig,
     ) -> BoxFuture<(UdpSocket, SocketAddr), RendezvousError>
     where
         C: Stream<Item = Bytes>,
         C: Sink<SinkItem = Bytes>,
-    <C as Stream>::Error: fmt::Debug,
-    <C as Sink>::SinkError: fmt::Debug,
-        C: 'static
+        <C as Stream>::Error: fmt::Debug,
+        <C as Sink>::SinkError: fmt::Debug,
+        C: 'static,
     {
         let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let our_privkey = config.our_privkey.clone();
@@ -189,8 +171,13 @@ impl UdpStreamExt for UdpSocket {
                         open_addrs: our_addrs.iter().cloned().collect(),
                         rendezvous_addrs: Vec::new(),
                     };
-                    let fut = exchange_msg(channel, &msg)
-                        .and_then(move |UdpRendezvousMsg{pubkey, nonce, open_addrs, rendezvous_addrs}| {
+                    let fut = exchange_msg(channel, &msg).and_then(
+                        move |UdpRendezvousMsg {
+                                  pubkey,
+                                  nonce,
+                                  open_addrs,
+                                  rendezvous_addrs,
+                              }| {
                             let their_addrs_set: HashSet<_> = open_addrs.into_iter().collect();
                             let our_addrs_set: HashSet<_> = our_addrs.iter().cloned().collect();
                             let their_open_addrs = filter_addrs(&our_addrs_set, &their_addrs_set);
@@ -205,22 +192,26 @@ impl UdpStreamExt for UdpSocket {
                                 true,
                             );
                             future::ok(incoming)
-                        });
+                        },
+                    );
                     Box::new(fut) as BoxFuture<_, _>
                 }
                 Err(err) => {
                     println!("public bind failed: {:?}", err);
-                    let listen_socket = UdpSocket::bind_reusable(&listen_addr, &handle0, None).unwrap();
+                    let listen_socket =
+                        UdpSocket::bind_reusable(&listen_addr, &handle0, None).unwrap();
                     let handle01 = handle0.clone();
                     let hole_punching_sockets = future::loop_fn(Vec::new(), move |mut sockets| {
                         if sockets.len() == 6 {
-                            return Box::new(future::ok(Loop::Break((sockets, None)))) as BoxFuture<_, _>;
+                            return Box::new(future::ok(Loop::Break((sockets, None))))
+                                as BoxFuture<_, _>;
                         }
 
-                        let socket = UdpSocket::bind_reusable(&listen_addr, &handle01, None).unwrap();
+                        let socket =
+                            UdpSocket::bind_reusable(&listen_addr, &handle01, None).unwrap();
                         let bind_addr = socket.local_addr().unwrap();
-                        let fut = rendezvous_addr(&handle01, bind_addr, stun_server)
-                            .then(move |result| match result {
+                        let fut = rendezvous_addr(&handle01, bind_addr, stun_server).then(
+                            move |result| match result {
                                 Ok(addr) => {
                                     sockets.push((socket, addr));
                                     future::ok((Loop::Continue(sockets)))
@@ -228,38 +219,40 @@ impl UdpStreamExt for UdpSocket {
                                 Err(err) => {
                                     future::ok(Loop::Break((sockets, Some(map_error(err)))))
                                 }
-                            });
+                            },
+                        );
                         Box::new(fut) as BoxFuture<_, _>
                     });
 
                     let handle02 = handle0.clone();
                     let fut = hole_punching_sockets.and_then(
-                        move |(sockets, err_opt): (Vec<(UdpSocket, SocketAddr)>, Option<RendezvousError>)| {
-                        let (sockets, rendezvous_addrs) = sockets
-                            .into_iter()
-                            .unzip::<_, _, Vec<_>, _>();
-                        let open_addrs = listen_socket.expanded_local_addrs().unwrap();
-                        let open_addrs_set: HashSet<SocketAddr> = open_addrs.into_iter().collect();
-                        let our_pubkey = PublicKey::from_secret_key(&SECP256K1, &our_privkey);
-                        let our_nonce: RendezvousNonce = rand::random();
-                        let msg = UdpRendezvousMsg {
-                            pubkey: our_pubkey,
-                            nonce: our_nonce,
-                            open_addrs: open_addrs_set.clone(),
-                            rendezvous_addrs,
-                        };
-                        exchange_msg(channel, &msg)
-                            .and_then(move |their_msg| {
-                                let UdpRendezvousMsg{
+                        move |(sockets, err_opt): (
+                            Vec<(UdpSocket, SocketAddr)>,
+                            Option<RendezvousError>,
+                        )| {
+                            let (sockets, rendezvous_addrs) =
+                                sockets.into_iter().unzip::<_, _, Vec<_>, _>();
+                            let open_addrs = listen_socket.expanded_local_addrs().unwrap();
+                            let open_addrs_set: HashSet<SocketAddr> =
+                                open_addrs.into_iter().collect();
+                            let our_pubkey = PublicKey::from_secret_key(&SECP256K1, &our_privkey);
+                            let our_nonce: RendezvousNonce = rand::random();
+                            let msg = UdpRendezvousMsg {
+                                pubkey: our_pubkey,
+                                nonce: our_nonce,
+                                open_addrs: open_addrs_set.clone(),
+                                rendezvous_addrs,
+                            };
+                            exchange_msg(channel, &msg).and_then(move |their_msg| {
+                                let UdpRendezvousMsg {
                                     pubkey: their_pubkey,
                                     nonce: their_nonce,
                                     open_addrs: their_open_addrs_set,
                                     rendezvous_addrs: their_rendezvous_addrs,
                                 } = their_msg;
                                 let mut punchers = FuturesUnordered::new();
-                                for (socket, their_addr) in sockets
-                                    .into_iter()
-                                    .zip(their_rendezvous_addrs)
+                                for (socket, their_addr) in
+                                    sockets.into_iter().zip(their_rendezvous_addrs)
                                 {
                                     let shared = SharedUdpSocket::share(socket);
                                     let with_addr = shared.with_address(their_addr);
@@ -284,9 +277,11 @@ impl UdpStreamExt for UdpSocket {
                                     their_open_addrs,
                                     false,
                                 ).select(punchers);
-                                Box::new(future::ok(Box::new(incoming) as BoxStream<_, _>)) as BoxFuture<_, _>
+                                Box::new(future::ok(Box::new(incoming) as BoxStream<_, _>))
+                                    as BoxFuture<_, _>
                             })
-                    });
+                        },
+                    );
                     Box::new(fut) as BoxFuture<_, _>
                 }
             })
@@ -296,40 +291,35 @@ impl UdpStreamExt for UdpSocket {
     }
 }
 
-fn select_socket<S>(
-    incoming: S,
-) -> BoxFuture<(UdpSocket, SocketAddr), RendezvousError>
-    where S: Stream<Item = (WithAddress, bool), Error = RendezvousError>,
+fn select_socket<S>(incoming: S) -> BoxFuture<(UdpSocket, SocketAddr), RendezvousError>
+where
+    S: Stream<Item = (WithAddress, bool), Error = RendezvousError>,
     <S as Stream>::Error: fmt::Debug,
-          S: 'static,
+    S: 'static,
 {
     let fut = loop_fn(incoming, |incoming| {
-        incoming
-            .into_future()
-            .then(|res| {
-                match res {
-                    Ok((item_opt, incoming)) => {
-                        item_opt
-                            .map(|(with_addr, chosen)| {
-                                let addr = with_addr.remote_addr();
-                                let socket = with_addr.steal().unwrap();
-                                let fut = future::ok(Loop::Break((socket, addr)));
-                                Box::new(fut) as BoxFuture<_, _>
-                            })
-                            .unwrap_or_else(|| {
-                                warn!("No more stream ???");
-                                let fut = future::ok(Loop::Continue(incoming));
-                                Box::new(fut) as BoxFuture<_, _>
-                            })
-                    }
-                    Err((err, incoming)) => {
-                        // FIXME: remove this addres from the state
-                        warn!("UDP socket error: {:?}", err);
+        incoming.into_future().then(|res| {
+            match res {
+                Ok((item_opt, incoming)) => item_opt
+                    .map(|(with_addr, chosen)| {
+                        let addr = with_addr.remote_addr();
+                        let socket = with_addr.steal().unwrap();
+                        let fut = future::ok(Loop::Break((socket, addr)));
+                        Box::new(fut) as BoxFuture<_, _>
+                    })
+                    .unwrap_or_else(|| {
+                        warn!("No more stream ???");
                         let fut = future::ok(Loop::Continue(incoming));
                         Box::new(fut) as BoxFuture<_, _>
-                    }
+                    }),
+                Err((err, incoming)) => {
+                    // FIXME: remove this addres from the state
+                    warn!("UDP socket error: {:?}", err);
+                    let fut = future::ok(Loop::Continue(incoming));
+                    Box::new(fut) as BoxFuture<_, _>
                 }
-            })
+            }
+        })
     });
     Box::new(fut) as BoxFuture<_, _>
 }
@@ -341,12 +331,13 @@ fn exchange_msg<C>(
 where
     C: Stream<Item = Bytes>,
     C: Sink<SinkItem = Bytes>,
-<C as Stream>::Error: fmt::Debug,
-<C as Sink>::SinkError: fmt::Debug,
+    <C as Stream>::Error: fmt::Debug,
+    <C as Sink>::SinkError: fmt::Debug,
     C: 'static,
 {
     let msg_bytes = Bytes::from(bincode::serialize(msg).unwrap());
-    let fut = channel.send(msg_bytes)
+    let fut = channel
+        .send(msg_bytes)
         .map_err(map_error)
         .and_then(move |channel| {
             channel
@@ -371,7 +362,7 @@ fn rendezvous_addr(
     // Get public address from IGD
     let bind_addr_v4 = match bind_addr {
         SocketAddr::V4(v) => v,
-        _ => unreachable!()
+        _ => unreachable!(),
     };
     let fut = search_gateway(&handle)
         .map_err(map_error)

@@ -1,61 +1,33 @@
-
+use bincode;
+use bytes::Bytes;
 use futures::{
-    stream,
-    Future,
-    Stream,
-    Sink,
-    Async,
-    AsyncSink,
-    Poll,
-    future::{
-        self,
-        loop_fn,
-        Loop,
-    },
+    future::{self, loop_fn, Loop},
+    stream, Async, AsyncSink, Future, Poll, Sink, Stream,
 };
+use igd::{tokio::search_gateway, PortMappingProtocol};
+use net2::UdpBuilder;
+use rand;
+use rustun::client::UdpClient;
+use rustun::rfc5389;
+use secp256k1::{Message, PublicKey, Secp256k1, SecretKey, Signature};
+use std::collections::HashSet;
+use std::fmt;
+use std::io;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 use tokio::io as async_io;
 use tokio_core::{
     self,
+    net::{TcpListener, TcpStream, UdpSocket},
     reactor::Handle,
-    net::{
-        TcpStream,
-        TcpListener,
-        UdpSocket,
-    },
 };
-use tokio_shared_udp_socket::{
-    SharedUdpSocket,
-    WithAddress
-};
-use net2::UdpBuilder;
-use bytes::Bytes;
-use std::io;
-use std::fmt;
-use std::time::{Duration, Instant};
-use std::net::SocketAddr;
-use std::collections::HashSet;
-use igd::{
-    PortMappingProtocol,
-    tokio::search_gateway,
-};
-use rustun::client::UdpClient;
-use rustun::rfc5389;
-use secp256k1::{Secp256k1, SecretKey, PublicKey, Message, Signature};
-use rand;
-use bincode;
+use tokio_shared_udp_socket::{SharedUdpSocket, WithAddress};
 
-use error::{RendezvousError, map_error};
-use addr::{SocketAddrExt, IpAddrExt, filter_addrs};
+use addr::{filter_addrs, IpAddrExt, SocketAddrExt};
+use error::{map_error, RendezvousError};
 use util::{
-    SECP256K1,
-    BoxFuture,
-    BoxStream,
-    RendezvousNonce,
-    UdpRendezvousMsg,
-    RendezvousConfig,
-    sign_data,
-    recover_data,
-    public_addr_from_stun,
+    public_addr_from_stun, recover_data, sign_data, BoxFuture, BoxStream, RendezvousConfig,
+    RendezvousNonce, SECP256K1, UdpRendezvousMsg,
 };
 
 /// This is the maximum possible TTL. TTL runners never exceed this TTL.
@@ -194,7 +166,7 @@ impl HolePunching {
                 } else {
                     Err(RendezvousError::Any(format!("Invalid recovered nonce")))
                 }
-            },
+            }
             Err(e) => Err(RendezvousError::Any(format!("Verify sign error: {:?}", e))),
         }
     }
@@ -210,13 +182,15 @@ impl HolePunching {
                 let now = Instant::now();
                 while now - *time_of_last_ttl_increment > ttl_increment_duration {
                     let ttl = {
-                        self.socket.as_mut()
+                        self.socket
+                            .as_mut()
                             .unwrap()
                             .ttl()
                             .map_err(|_| RendezvousError::Any(format!("GetTtl")))
                     }?;
                     if ttl < MAX_TTL {
-                        self.socket.as_mut()
+                        self.socket
+                            .as_mut()
                             .unwrap()
                             .set_ttl(ttl + 1)
                             .map_err(|_| RendezvousError::Any(format!("SetTtl")))?;
@@ -246,7 +220,8 @@ impl HolePunching {
             HolePunchMsg::Syn => match self.phase {
                 HolePunchingPhase::Syn { .. } => {
                     self.phase = HolePunchingPhase::Ack;
-                    self.socket.as_mut()
+                    self.socket
+                        .as_mut()
                         .unwrap()
                         .set_ttl(SANE_DEFAULT_TTL)
                         .map_err(|_| RendezvousError::Any(format!("SetTtl")))?;

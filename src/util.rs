@@ -1,38 +1,26 @@
-
-
+use bytes::Bytes;
 use futures::{
-    stream,
-    Future,
-    Stream,
-    Sink,
-    future::{
-        self,
-        loop_fn,
-        Loop,
-    },
-};
-use tokio::io as async_io;
-use tokio_core::{
-    reactor::Handle,
-    net::{
-        TcpStream,
-        TcpListener,
-    },
+    future::{self, loop_fn, Loop},
+    stream, Future, Sink, Stream,
 };
 use net2::TcpBuilder;
-use bytes::Bytes;
+use tokio::io as async_io;
+use tokio_core::{
+    net::{TcpListener, TcpStream},
+    reactor::Handle,
+};
 // use std::time::{Instant, Duration};
-use std::net::SocketAddr;
-use std::collections::HashSet;
+use bincode;
 use fibers::{Executor, InPlaceExecutor, Spawn};
-use rustun::{Method, Client};
 use rustun::client::UdpClient;
 use rustun::rfc5389;
-use secp256k1::{self, Secp256k1, SecretKey, PublicKey, Message, Signature};
-use serde::{Serialize, Deserialize};
-use bincode;
+use rustun::{Client, Method};
+use secp256k1::{self, Message, PublicKey, Secp256k1, SecretKey, Signature};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::net::SocketAddr;
 
-use super::error::{RendezvousError, map_error};
+use super::error::{map_error, RendezvousError};
 
 lazy_static! {
     pub static ref SECP256K1: Secp256k1<secp256k1::All> = Secp256k1::new();
@@ -41,7 +29,6 @@ lazy_static! {
 pub type RendezvousNonce = [u8; 32];
 pub type BoxFuture<I, E> = Box<Future<Item = I, Error = E>>;
 pub type BoxStream<I, E> = Box<Stream<Item = I, Error = E>>;
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TcpRendezvousMsg {
@@ -70,7 +57,7 @@ pub struct RendezvousConfig {
 
 pub fn sign_data<T: ?Sized>(privkey: &SecretKey, value: &T) -> Vec<u8>
 where
-    T: Serialize
+    T: Serialize,
 {
     bincode::serialize(value)
         .map(|data| {
@@ -87,11 +74,9 @@ where
         .unwrap()
 }
 
-pub fn recover_data<'a, T>(
-    signed_data: &'a [u8],
-    pubkey: &PublicKey,
-) -> Result<T, RendezvousError>
-    where T: Deserialize<'a>,
+pub fn recover_data<'a, T>(signed_data: &'a [u8], pubkey: &PublicKey) -> Result<T, RendezvousError>
+where
+    T: Deserialize<'a>,
 {
     let signature = &signed_data[0..64];
     let data = &signed_data[64..];
@@ -99,7 +84,8 @@ pub fn recover_data<'a, T>(
         .map_err(map_error)
         .and_then(move |sign| {
             let msg = Message::from_slice(data).unwrap();
-            SECP256K1.verify(&msg, &sign, pubkey)
+            SECP256K1
+                .verify(&msg, &sign, pubkey)
                 .map(|_| bincode::deserialize(data).unwrap())
                 .map_err(map_error)
         })
@@ -113,7 +99,8 @@ pub fn public_addr_from_stun(server: SocketAddr) -> Vec<SocketAddr> {
     let request = rfc5389::methods::Binding.request::<rfc5389::Attribute>();
     let monitor = executor.spawn_monitor(client.call(request));
 
-    match executor.run_fiber(monitor)
+    match executor
+        .run_fiber(monitor)
         .map_err(|err| {
             warn!("STUN error: {:?}", err);
             err
@@ -127,22 +114,17 @@ pub fn public_addr_from_stun(server: SocketAddr) -> Vec<SocketAddr> {
     {
         Ok(resp) => {
             debug!("OK: {:?}", resp);
-            resp
-                .attributes()
+            resp.attributes()
                 .into_iter()
-                .filter_map(|attr| {
-                    match attr {
-                        rfc5389::Attribute::XorMappedAddress(addr) => {
-                            Some(addr.address())
-                        }
-                        _ => None
-                    }
+                .filter_map(|attr| match attr {
+                    rfc5389::Attribute::XorMappedAddress(addr) => Some(addr.address()),
+                    _ => None,
                 })
                 .collect::<Vec<SocketAddr>>()
-        },
+        }
         Err(e) => {
             debug!("ERROR: {:?}", e);
             Vec::new()
-        },
+        }
     }
 }
