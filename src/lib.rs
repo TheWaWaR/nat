@@ -8,6 +8,7 @@ extern crate tokio;
 extern crate tokio_core;
 extern crate tokio_codec;
 extern crate tokio_timer;
+extern crate tokio_shared_udp_socket;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;

@@ -42,8 +42,10 @@ use util::{
     SECP256K1,
     BoxFuture,
     RendezvousNonce,
-    RendezvousMsg,
+    TcpRendezvousMsg,
     RendezvousConfig,
+    sign_data,
+    recover_data,
     public_addr_from_stun,
 };
 
@@ -201,7 +203,7 @@ impl TcpStreamExt for TcpStream {
                 // Exchange connection info
                 let our_pubkey = PublicKey::from_secret_key(&SECP256K1, &our_privkey);
                 let our_nonce: RendezvousNonce = rand::random();
-                let msg = RendezvousMsg {
+                let msg = TcpRendezvousMsg {
                     pubkey: our_pubkey,
                     nonce: our_nonce.clone(),
                     open_addrs: our_addrs.iter().cloned().collect(),
@@ -220,7 +222,7 @@ impl TcpStreamExt for TcpStream {
                                 err
                             })
                             .and_then(|msg_bytes| {
-                                let msg: RendezvousMsg = bincode::deserialize(&msg_bytes).unwrap();
+                                let msg: TcpRendezvousMsg = bincode::deserialize(&msg_bytes).unwrap();
                                 debug!("Receive rendezvous message: {:?}", msg);
                                 Ok(msg)
                             })
@@ -228,7 +230,7 @@ impl TcpStreamExt for TcpStream {
                             .map(|(item_opt, _)| item_opt.unwrap())
                             .map_err(|(err, _)| map_error(err))
                     })
-                    .and_then(move |RendezvousMsg{pubkey, nonce, open_addrs, rendezvous_addr}| {
+                    .and_then(move |TcpRendezvousMsg{pubkey, nonce, open_addrs, rendezvous_addr}| {
                         let their_addrs_set: HashSet<_> = open_addrs.into_iter().collect();
                         let our_addrs_set: HashSet<_> = our_addrs.iter().cloned().collect();
                         let mut their_addrs: HashSet<_> = filter_addrs(&our_addrs_set, &their_addrs_set);
@@ -239,11 +241,8 @@ impl TcpStreamExt for TcpStream {
 
                         let their_nonce = nonce;
                         let their_pubkey = pubkey;
-                        let signed_data: [u8; 64] = bincode::serialize(&their_nonce)
-                            .map(|data| Message::from_slice(&data).unwrap())
-                            .map(|msg| SECP256K1.sign(&msg, &our_privkey))
-                            .map(|sign| sign.serialize_compact(&SECP256K1))
-                            .unwrap();
+                        let signed_data: Vec<u8> = sign_data(&our_privkey, &their_nonce);
+                        let signed_data_len = signed_data.len();
 
                         let connectors = their_addrs
                             .into_iter()
@@ -273,7 +272,7 @@ impl TcpStreamExt for TcpStream {
                             .and_then(move |stream| {
                                 debug!("Handshake message sent");
                                 // FIXME: Should have deadline
-                                let buf = vec![0u8; 64];
+                                let buf = vec![0u8; signed_data_len];
                                 async_io::read_exact(stream, buf)
                                     .map_err(|err| {
                                         debug!("Read from stream error: {:?}", err);
@@ -282,17 +281,18 @@ impl TcpStreamExt for TcpStream {
                                     .map_err(map_error)
                                     .and_then(move |(stream, signed_data): (TcpStream, Vec<u8>)| {
                                         debug!("Receive handshake message from {:?}", stream.peer_addr());
-                                        Signature::from_compact(&SECP256K1, &signed_data)
-                                            .map_err(map_error)
-                                            .and_then(move |sign| {
-                                                let data = bincode::serialize(&our_nonce).unwrap();
-                                                let msg = Message::from_slice(&data).unwrap();
-                                                SECP256K1.verify(&msg, &sign, &their_pubkey)
-                                                    .map_err(map_error)
+                                        recover_data(&signed_data, &their_pubkey)
+                                            .and_then(|nonce: RendezvousNonce| {
+                                                if nonce == our_nonce {
+                                                    Ok(stream)
+                                                } else {
+                                                    Err(RendezvousError::Any(format!("Invalid recovered nonce")))
+                                                }
                                             })
-                                            .map(|_| stream)
                                     })
                             });
+
+                        // Loop to find one valid stream
                         let fut = loop_fn(tcp_streams, |streams| {
                             streams
                                 .into_future()
