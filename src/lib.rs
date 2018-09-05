@@ -1,3 +1,4 @@
+extern crate byteorder;
 extern crate bytes;
 #[macro_use]
 extern crate log;
@@ -19,6 +20,7 @@ extern crate igd;
 extern crate net2;
 extern crate rustun;
 extern crate secp256k1;
+extern crate tiny_keccak;
 #[macro_use]
 extern crate lazy_static;
 extern crate rand;

@@ -1,9 +1,11 @@
+use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use futures::{
     future::{self, loop_fn, Loop},
     stream, Future, Sink, Stream,
 };
 use net2::TcpBuilder;
+use tiny_keccak;
 use tokio::io as async_io;
 use tokio_core::{
     net::{TcpListener, TcpStream},
@@ -61,14 +63,18 @@ where
 {
     bincode::serialize(value)
         .map(|data| {
-            let msg = Message::from_slice(&data).unwrap();
+            let digest = tiny_keccak::keccak256(&data);
+            let msg = Message::from_slice(&digest).unwrap();
             (data, msg)
         })
         .map(|(data, msg)| (data, SECP256K1.sign(&msg, privkey)))
         .map(|(data, sign)| {
-            let mut all_data = Vec::new();
-            all_data.extend(&data);
-            all_data.extend(sign.serialize_compact(&SECP256K1).into_iter());
+            let signature = sign.serialize_compact(&SECP256K1);
+            let content_len = signature.len() + data.len();
+            let mut all_data = vec![0u8; content_len + 2];
+            LittleEndian::write_u16(&mut all_data, content_len as u16);
+            all_data[2..66].copy_from_slice(&signature);
+            all_data[66..].copy_from_slice(&data);
             all_data
         })
         .unwrap()
@@ -78,12 +84,15 @@ pub fn recover_data<'a, T>(signed_data: &'a [u8], pubkey: &PublicKey) -> Result<
 where
     T: Deserialize<'a>,
 {
-    let signature = &signed_data[0..64];
-    let data = &signed_data[64..];
+    let content_len = LittleEndian::read_u16(&signed_data[0..2]) as usize;
+    let signature = &signed_data[2..66];
+    let data = &signed_data[66..];
+    assert_eq!(content_len, signed_data.len() - 2);
     Signature::from_compact(&SECP256K1, signature)
         .map_err(map_error)
         .and_then(move |sign| {
-            let msg = Message::from_slice(data).unwrap();
+            let digest = tiny_keccak::keccak256(&data);
+            let msg = Message::from_slice(&digest).unwrap();
             SECP256K1
                 .verify(&msg, &sign, pubkey)
                 .map(|_| bincode::deserialize(data).unwrap())

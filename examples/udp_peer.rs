@@ -6,15 +6,16 @@ extern crate secp256k1;
 extern crate tokio_core;
 extern crate tokio_io;
 
-use futures::{Async, AsyncSink, Future, Sink, Stream};
+use futures::future::Loop;
+use futures::{future, Async, AsyncSink, Future, Sink, Stream};
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use std::fmt;
-use std::net::{Shutdown, SocketAddr};
-use tokio_core::net::TcpStream;
+use std::net::SocketAddr;
+use tokio_core::net::{TcpStream, UdpSocket};
 use tokio_core::reactor::Core;
 use tokio_io::codec::length_delimited::Framed;
 
-use nat::{RendezvousConfig, TcpStreamExt};
+use nat::{RendezvousConfig, UdpSocketExt};
 
 // TODO: figure out how to not need this.
 struct DummyDebug<S>(S);
@@ -128,26 +129,38 @@ fn main() {
 
     let mut core = Core::new().unwrap();
     let handle = core.handle();
-    let fut = TcpStream::connect(&relay_server, &handle)
-        .map_err(|e| panic!("error connecting to relay server: {:?}", e))
-        .and_then(move |relay_stream| {
-            let relay_channel = DummyDebug(Framed::new(relay_stream).map(|bytes| bytes.freeze()));
-            TcpStream::rendezvous_connect(relay_channel, &handle, &config)
-                .map_err(|e| panic!("rendezvous connect failed: {:?}", e))
-                .and_then(|stream| {
-                    println!("connected!");
-                    tokio_io::io::write_all(stream, message)
-                        .map_err(|e| panic!("error writing to tcp stream: {:?}", e))
-                        .and_then(|(stream, _)| {
-                            stream.shutdown(Shutdown::Write).unwrap();
-                            tokio_io::io::read_to_end(stream, Vec::new())
-                                .map_err(|e| panic!("error reading from tcp stream: {:?}", e))
-                                .map(|(_, data)| {
-                                    let recv_message = String::from_utf8_lossy(&data);
-                                    println!("got message: {} = {:?}", recv_message, data);
+    let fut =
+        TcpStream::connect(&relay_server, &handle)
+            .map_err(|e| panic!("error connecting to relay server: {:?}", e))
+            .and_then(move |relay_stream| {
+                let relay_channel =
+                    DummyDebug(Framed::new(relay_stream).map(|bytes| bytes.freeze()));
+                UdpSocket::rendezvous_connect(relay_channel, &handle, &config)
+                    .map_err(|e| panic!("rendezvous connect failed: {:?}", e))
+                    .and_then(|(socket, remote_addr)| {
+                        println!("connected to {:?}!", remote_addr);
+                        socket
+                            .send_dgram(message, remote_addr)
+                            .map_err(|e| panic!("error writing to udp socket: {}", e))
+                            .and_then(move |(socket, _)| {
+                                println!("Message sent");
+                                future::loop_fn(socket, move |socket| {
+                                    let buffer = vec![0u8; 4 * 1024];
+                                    socket
+                                        .recv_dgram(buffer)
+                                        .map_err(|e| panic!("error receiving on udp socket: {}", e))
+                                        .map(move |(socket, buffer, len, recv_addr)| {
+                                            if recv_addr == remote_addr {
+                                                let recv_message =
+                                                    String::from_utf8_lossy(&buffer[..len]);
+                                                println!("got message: {}", recv_message);
+                                            }
+                                            let result: Loop<(), _> = Loop::Continue(socket);
+                                            result
+                                        })
                                 })
-                        })
-                })
-        });
+                            })
+                    })
+            });
     core.run(fut).unwrap();
 }

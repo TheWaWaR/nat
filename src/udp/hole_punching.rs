@@ -1,5 +1,7 @@
 use bincode;
-use bytes::Bytes;
+use byteorder::{ByteOrder, LittleEndian};
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::stream::futures_unordered::FuturesUnordered;
 use futures::{
     future::{self, loop_fn, Loop},
     stream, Async, AsyncSink, Future, Poll, Sink, Stream,
@@ -55,6 +57,8 @@ pub struct HolePunching {
     their_nonce: RendezvousNonce,
     their_pubkey: PublicKey,
     phase: HolePunchingPhase,
+    // Poor man's codec
+    data: BytesMut,
 }
 
 enum HolePunchingPhase {
@@ -90,6 +94,7 @@ impl HolePunching {
                 time_of_last_ttl_increment: Instant::now(),
                 ttl_increment_duration: Duration::new(u64::max_value(), 0),
             },
+            data: BytesMut::with_capacity(64 * 1024),
         }
     }
 
@@ -116,6 +121,7 @@ impl HolePunching {
                     duration_to_reach_max_ttl / (REALISTIC_MAX_TTL - HOLE_PUNCH_INITIAL_TTL)
                 },
             },
+            data: BytesMut::default(),
         }
     }
 
@@ -157,17 +163,31 @@ impl HolePunching {
             Ok(Async::Ready(None)) => return Err(RendezvousError::Any(format!("SocketStolen"))),
             Ok(Async::Ready(Some(bytes))) => bytes,
         };
-        let result: Result<(RendezvousNonce, HolePunchMsg), RendezvousError> =
-            recover_data(&bytes, &self.their_pubkey);
-        match result {
-            Ok((nonce, msg)) => {
-                if nonce == self.our_nonce {
-                    Ok(Async::Ready(msg))
-                } else {
-                    Err(RendezvousError::Any(format!("Invalid recovered nonce")))
+        self.data.put(bytes);
+
+        if self.data.len() >= 2 {
+            let content_len = LittleEndian::read_u16(&self.data[0..2]) as usize;
+            if self.data.len() >= content_len + 2 {
+                let content = self.data.split_to(content_len + 2);
+                let result: Result<
+                    (RendezvousNonce, HolePunchMsg),
+                    RendezvousError,
+                > = recover_data(&content, &self.their_pubkey);
+                match result {
+                    Ok((nonce, msg)) => {
+                        if nonce == self.our_nonce {
+                            Ok(Async::Ready(msg))
+                        } else {
+                            Err(RendezvousError::Any(format!("Invalid recovered nonce")))
+                        }
+                    }
+                    Err(e) => Err(RendezvousError::Any(format!("Verify sign error: {:?}", e))),
                 }
+            } else {
+                Ok(Async::NotReady)
             }
-            Err(e) => Err(RendezvousError::Any(format!("Verify sign error: {:?}", e))),
+        } else {
+            Ok(Async::NotReady)
         }
     }
 
@@ -305,7 +325,7 @@ impl Future for HolePunching {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 enum HolePunchMsg {
     Syn,
     Ack,
@@ -342,4 +362,139 @@ impl Future for Timeout {
     fn poll(&mut self) -> Result<Async<()>, RendezvousError> {
         Ok(self.inner.poll().unwrap())
     }
+}
+
+pub fn choose<S>(
+    incoming: S,
+    our_privkey: SecretKey,
+    our_pubkey: PublicKey,
+    our_nonce: RendezvousNonce,
+    their_pubkey: PublicKey,
+    their_nonce: RendezvousNonce,
+) -> BoxFuture<(UdpSocket, SocketAddr), RendezvousError>
+where
+    S: Stream<Item = (WithAddress, bool), Error = RendezvousError>,
+    <S as Stream>::Error: fmt::Debug,
+    S: 'static,
+{
+    let fut = loop_fn(incoming, move |incoming| {
+        incoming.into_future().then(move |res| {
+            match res {
+                Ok((item_opt, incoming)) => match item_opt {
+                    Some((with_addr, chosen)) => {
+                        let we_choose = our_pubkey > their_pubkey;
+                        match (we_choose, chosen) {
+                            (true, true) => {
+                                let fut =
+                                    future::err(RendezvousError::Any(format!("UnexpectedMessage")));
+                                Box::new(fut) as BoxFuture<_, _>
+                            }
+                            (true, false) => {
+                                // send choose message, then return ok
+                                let msg = HolePunchMsg::Choose;
+                                let signed_data = sign_data(&our_privkey, &(&their_nonce, msg));
+                                let bytes = Bytes::from(signed_data);
+                                let fut =
+                                    with_addr.send(bytes).map_err(map_error).map(|with_addr| {
+                                        let addr = with_addr.remote_addr();
+                                        let socket = with_addr.steal().unwrap();
+                                        Loop::Break((socket, addr))
+                                    });
+                                Box::new(fut) as BoxFuture<_, _>
+                            }
+                            (false, true) => {
+                                // been chosen, return ok
+                                let addr = with_addr.remote_addr();
+                                let socket = with_addr.steal().unwrap();
+                                let fut = future::ok(Loop::Break((socket, addr)));
+                                Box::new(fut) as BoxFuture<_, _>
+                            }
+                            (false, false) => {
+                                // take choose message
+                                let fut = take_choose(with_addr, our_nonce, their_pubkey)
+                                    .map(|(socket, addr)| Loop::Break((socket, addr)));
+                                Box::new(fut) as BoxFuture<_, _>
+                            }
+                        }
+                    }
+                    None => {
+                        warn!("No more stream ???");
+                        let fut = future::ok(Loop::Continue(incoming));
+                        Box::new(fut) as BoxFuture<_, _>
+                    }
+                },
+                Err((err, incoming)) => {
+                    // FIXME: remove this addres from the state
+                    warn!("UDP socket error: {:?}", err);
+                    let fut = future::ok(Loop::Continue(incoming));
+                    Box::new(fut) as BoxFuture<_, _>
+                }
+            }
+        })
+    });
+    Box::new(fut) as BoxFuture<_, _>
+}
+
+fn take_choose(
+    with_addr: WithAddress,
+    our_nonce: RendezvousNonce,
+    their_pubkey: PublicKey,
+) -> BoxFuture<(UdpSocket, SocketAddr), RendezvousError> {
+    let fut = loop_fn(
+        (with_addr, BytesMut::with_capacity(64 * 1024)),
+        move |(with_addr, mut data)| {
+            with_addr
+                .into_future()
+                .map_err(|(err, _)| map_error(err))
+                .and_then(move |(bytes_opt, with_addr)| {
+                    if let Some(bytes) = bytes_opt {
+                        data.put(bytes);
+                    }
+
+                    if data.len() >= 2 {
+                        let content_len = LittleEndian::read_u16(&data[0..2]) as usize;
+                        if data.len() >= content_len + 2 {
+                            let content = data.split_to(content_len + 2);
+                            let result: Result<
+                                (RendezvousNonce, HolePunchMsg),
+                                RendezvousError,
+                            > = recover_data(&content, &their_pubkey);
+                            match result {
+                                Ok((nonce, msg)) => {
+                                    if nonce == our_nonce {
+                                        if msg == HolePunchMsg::Choose {
+                                            let addr = with_addr.remote_addr();
+                                            let socket = with_addr.steal().unwrap();
+                                            let fut = future::ok(Loop::Break((socket, addr)));
+                                            Box::new(fut) as BoxFuture<_, _>
+                                        } else {
+                                            let fut = future::ok(Loop::Continue((with_addr, data)));
+                                            Box::new(fut) as BoxFuture<_, _>
+                                        }
+                                    } else {
+                                        let fut = future::err(RendezvousError::Any(format!(
+                                            "Invalid nonce"
+                                        )));
+                                        Box::new(fut) as BoxFuture<_, _>
+                                    }
+                                }
+                                Err(err) => {
+                                    let fut = future::err(RendezvousError::Any(format!(
+                                        "Invalid signature data"
+                                    )));
+                                    Box::new(fut) as BoxFuture<_, _>
+                                }
+                            }
+                        } else {
+                            let fut = future::ok(Loop::Continue((with_addr, data)));
+                            Box::new(fut) as BoxFuture<_, _>
+                        }
+                    } else {
+                        let fut = future::ok(Loop::Continue((with_addr, data)));
+                        Box::new(fut) as BoxFuture<_, _>
+                    }
+                })
+        },
+    );
+    Box::new(fut) as BoxFuture<_, _>
 }

@@ -7,5 +7,6 @@ pub enum RendezvousError {
 }
 
 pub fn map_error<E: fmt::Debug>(e: E) -> RendezvousError {
+    println!(">> map_error: {:?}", e);
     RendezvousError::Any(format!("{:?}", e))
 }

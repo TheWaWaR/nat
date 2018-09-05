@@ -23,7 +23,7 @@ use tokio_core::{
 };
 use tokio_shared_udp_socket::{SharedUdpSocket, WithAddress};
 
-use super::hole_punching::HolePunching;
+use super::hole_punching::{choose, HolePunching};
 use addr::{filter_addrs, IpAddrExt, SocketAddrExt};
 use error::{map_error, RendezvousError};
 use util::{
@@ -135,7 +135,14 @@ impl UdpSocketExt for UdpSocket {
             );
 
             public_addr_fut
-                .or_else(move |err| rendezvous_addr(&handle, bind_addr, stun_server))
+                .map(|public_addr| {
+                    debug!(
+                        "This bind_public address is global address: {:?}",
+                        public_addr
+                    );
+                    public_addr
+                })
+                .or_else(move |err| get_addr(&handle, bind_addr, stun_server, true))
                 .map(move |public_addr| (socket, bind_addr, public_addr))
         });
         Box::new(fut) as BoxFuture<_, _>
@@ -160,6 +167,7 @@ impl UdpSocketExt for UdpSocket {
         let fut = UdpSocket::bind_public(&listen_addr, handle, config)
             .then(move |result| match result {
                 Ok((socket, bind_addr, public_addr)) => {
+                    debug!("binding socket to {:?}", public_addr);
                     let mut our_addrs = socket.expanded_local_addrs().unwrap();
                     our_addrs.push(public_addr);
                     let our_addrs = our_addrs.into_iter().collect::<HashSet<_>>();
@@ -178,9 +186,11 @@ impl UdpSocketExt for UdpSocket {
                                   open_addrs,
                                   rendezvous_addrs,
                               }| {
+                            debug!("Got their pubkey: {:?}", pubkey);
                             let their_addrs_set: HashSet<_> = open_addrs.into_iter().collect();
                             let our_addrs_set: HashSet<_> = our_addrs.iter().cloned().collect();
                             let their_open_addrs = filter_addrs(&our_addrs_set, &their_addrs_set);
+                            let direction = our_pubkey > pubkey;
                             let incoming = open_connect(
                                 &handle0,
                                 our_privkey.clone(),
@@ -191,7 +201,14 @@ impl UdpSocketExt for UdpSocket {
                                 their_open_addrs,
                                 true,
                             );
-                            future::ok(incoming)
+                            future::ok((
+                                Box::new(incoming) as BoxStream<_, _>,
+                                our_privkey,
+                                our_pubkey,
+                                our_nonce,
+                                pubkey,
+                                nonce,
+                            ))
                         },
                     );
                     Box::new(fut) as BoxFuture<_, _>
@@ -210,9 +227,13 @@ impl UdpSocketExt for UdpSocket {
                         let socket =
                             UdpSocket::bind_reusable(&listen_addr, &handle01, None).unwrap();
                         let bind_addr = socket.local_addr().unwrap();
-                        let fut = rendezvous_addr(&handle01, bind_addr, stun_server).then(
+                        let fut = get_addr(&handle01, bind_addr, stun_server, false).then(
                             move |result| match result {
                                 Ok(addr) => {
+                                    debug!(
+                                        "open a socket for hole punching: rendezvous_addr={:?}",
+                                        addr
+                                    );
                                     sockets.push((socket, addr));
                                     future::ok((Loop::Continue(sockets)))
                                 }
@@ -230,6 +251,7 @@ impl UdpSocketExt for UdpSocket {
                             Vec<(UdpSocket, SocketAddr)>,
                             Option<RendezvousError>,
                         )| {
+                            debug!("Finish open 6 sockets for hole punching: {:?}", err_opt);
                             let (sockets, rendezvous_addrs) =
                                 sockets.into_iter().unzip::<_, _, Vec<_>, _>();
                             let open_addrs = listen_socket.expanded_local_addrs().unwrap();
@@ -250,6 +272,7 @@ impl UdpSocketExt for UdpSocket {
                                     open_addrs: their_open_addrs_set,
                                     rendezvous_addrs: their_rendezvous_addrs,
                                 } = their_msg;
+                                debug!("Got their pubkey: {:?}", their_pubkey);
                                 let mut punchers = FuturesUnordered::new();
                                 for (socket, their_addr) in
                                     sockets.into_iter().zip(their_rendezvous_addrs)
@@ -277,51 +300,36 @@ impl UdpSocketExt for UdpSocket {
                                     their_open_addrs,
                                     false,
                                 ).select(punchers);
-                                Box::new(future::ok(Box::new(incoming) as BoxStream<_, _>))
-                                    as BoxFuture<_, _>
+                                let direction = our_pubkey > their_pubkey;
+                                Box::new(future::ok((
+                                    Box::new(incoming) as BoxStream<_, _>,
+                                    our_privkey,
+                                    our_pubkey,
+                                    our_nonce,
+                                    their_pubkey,
+                                    their_nonce,
+                                ))) as BoxFuture<_, _>
                             })
                         },
                     );
                     Box::new(fut) as BoxFuture<_, _>
                 }
             })
-            .and_then(|incoming| select_socket(incoming));
+            .and_then(
+                |(incoming, our_privkey, our_pubkey, our_nonce, their_pubkey, their_nonce)| {
+                    choose(
+                        incoming,
+                        our_privkey,
+                        our_pubkey,
+                        our_nonce,
+                        their_pubkey,
+                        their_nonce,
+                    )
+                },
+            );
 
         Box::new(fut) as BoxFuture<_, _>
     }
-}
-
-fn select_socket<S>(incoming: S) -> BoxFuture<(UdpSocket, SocketAddr), RendezvousError>
-where
-    S: Stream<Item = (WithAddress, bool), Error = RendezvousError>,
-    <S as Stream>::Error: fmt::Debug,
-    S: 'static,
-{
-    let fut = loop_fn(incoming, |incoming| {
-        incoming.into_future().then(|res| {
-            match res {
-                Ok((item_opt, incoming)) => item_opt
-                    .map(|(with_addr, chosen)| {
-                        let addr = with_addr.remote_addr();
-                        let socket = with_addr.steal().unwrap();
-                        let fut = future::ok(Loop::Break((socket, addr)));
-                        Box::new(fut) as BoxFuture<_, _>
-                    })
-                    .unwrap_or_else(|| {
-                        warn!("No more stream ???");
-                        let fut = future::ok(Loop::Continue(incoming));
-                        Box::new(fut) as BoxFuture<_, _>
-                    }),
-                Err((err, incoming)) => {
-                    // FIXME: remove this addres from the state
-                    warn!("UDP socket error: {:?}", err);
-                    let fut = future::ok(Loop::Continue(incoming));
-                    Box::new(fut) as BoxFuture<_, _>
-                }
-            }
-        })
-    });
-    Box::new(fut) as BoxFuture<_, _>
 }
 
 fn exchange_msg<C>(
@@ -348,16 +356,19 @@ where
                     Ok(msg)
                 })
                 .into_future()
-                .map(|(item_opt, _)| item_opt.unwrap())
                 .map_err(|(err, _)| map_error(err))
+                .and_then(|(item_opt, _)| {
+                    item_opt.ok_or_else(|| RendezvousError::Any("Channel Timed out".to_string()))
+                })
         });
     Box::new(fut) as BoxFuture<_, _>
 }
 
-fn rendezvous_addr(
+fn get_addr(
     handle: &Handle,
     bind_addr: SocketAddr,
     stun_server: SocketAddr,
+    is_open: bool,
 ) -> BoxFuture<SocketAddr, RendezvousError> {
     // Get public address from IGD
     let bind_addr_v4 = match bind_addr {
@@ -367,18 +378,27 @@ fn rendezvous_addr(
     let fut = search_gateway(&handle)
         .map_err(map_error)
         .and_then(move |gateway| {
+            let duration = if is_open { 0 } else { 300 };
             gateway
-                .get_any_address(PortMappingProtocol::UDP, bind_addr_v4, 300, "nat")
+                .get_any_address(PortMappingProtocol::UDP, bind_addr_v4, duration, "nat")
                 .map_err(map_error)
                 .map(|public_v4addr| SocketAddr::V4(public_v4addr))
         })
         .or_else(move |err| {
             // Get public address from STUN
             trace!("get igd address error: {:?}", err);
-            public_addr_from_stun(stun_server)
-                .get(0)
-                .cloned()
-                .ok_or_else(|| RendezvousError::Any("can not get public ip from STUN".to_string()))
+            if is_open {
+                Err(RendezvousError::Any(
+                    "Will not get public ip from STUN".to_string(),
+                ))
+            } else {
+                public_addr_from_stun(stun_server)
+                    .get(0)
+                    .cloned()
+                    .ok_or_else(|| {
+                        RendezvousError::Any("can not get public ip from STUN".to_string())
+                    })
+            }
         });
     Box::new(fut) as BoxFuture<_, _>
 }
@@ -410,10 +430,10 @@ fn open_connect(
 
     let handle = handle.clone();
     let fut = stream::poll_fn(move || {
-        trace!(
-            "open_connect polling shared socket on {:?}",
-            shared.local_addr()
-        );
+        // trace!(
+        //     "open_connect polling shared socket on {:?}",
+        //     shared.local_addr()
+        // );
 
         loop {
             match shared.poll() {
@@ -436,7 +456,7 @@ fn open_connect(
                     break;
                 }
                 Ok(Async::NotReady) => {
-                    trace!("nothing has arrived on the socket (yet)");
+                    // trace!("nothing has arrived on the socket (yet)");
                     break;
                 }
                 Err(e) => {
@@ -447,9 +467,9 @@ fn open_connect(
         }
 
         match punchers.poll()? {
-            Async::Ready(Some(socket)) => {
-                trace!("puncher returned success!");
-                Ok(Async::Ready(Some(socket)))
+            Async::Ready(Some((socket, chosen))) => {
+                trace!("puncher returned success! chosen: {}", chosen);
+                Ok(Async::Ready(Some((socket, chosen))))
             }
             Async::Ready(None) => {
                 if we_are_open {
@@ -461,7 +481,7 @@ fn open_connect(
                 }
             }
             Async::NotReady => {
-                trace!("no punchers are ready yet");
+                // trace!("no punchers are ready yet");
                 Ok(Async::NotReady)
             }
         }
