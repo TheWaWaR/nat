@@ -163,6 +163,12 @@ impl HolePunching {
             Ok(Async::Ready(None)) => return Err(RendezvousError::Any(format!("SocketStolen"))),
             Ok(Async::Ready(Some(bytes))) => bytes,
         };
+        match self.socket {
+            Some(ref socket) => {
+                debug!("Received {} bytes from {:?}", bytes.len(), socket.remote_addr());
+            }
+            None => {}
+        }
         self.data.put(bytes);
 
         if self.data.len() >= 2 {
