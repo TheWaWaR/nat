@@ -138,12 +138,17 @@ fn main() {
                 UdpSocket::rendezvous_connect(relay_channel, &handle, &config)
                     .map_err(|e| panic!("rendezvous connect failed: {:?}", e))
                     .and_then(|(socket, remote_addr)| {
-                        println!("connected to {:?}!", remote_addr);
+                        println!(
+                            "connected from {:?} to {:?}!",
+                            socket.local_addr(),
+                            remote_addr
+                        );
                         socket
                             .send_dgram(message, remote_addr)
                             .map_err(|e| panic!("error writing to udp socket: {}", e))
                             .and_then(move |(socket, _)| {
                                 println!("Message sent");
+                                use std::thread;
                                 future::loop_fn(socket, move |socket| {
                                     let buffer = vec![0u8; 4 * 1024];
                                     socket
@@ -154,6 +159,7 @@ fn main() {
                                                 let recv_message =
                                                     String::from_utf8_lossy(&buffer[..len]);
                                                 println!("got message: {}", recv_message);
+                                                thread::sleep_ms(200);
                                             }
                                             let result: Loop<(), _> = Loop::Continue(socket);
                                             result

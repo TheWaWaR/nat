@@ -219,7 +219,7 @@ impl UdpSocketExt for UdpSocket {
                         UdpSocket::bind_reusable(&listen_addr, &handle0, None).unwrap();
                     let handle01 = handle0.clone();
                     let hole_punching_sockets = future::loop_fn(Vec::new(), move |mut sockets| {
-                        if sockets.len() == 6 {
+                        if sockets.len() == 3 {
                             return Box::new(future::ok(Loop::Break((sockets, None))))
                                 as BoxFuture<_, _>;
                         }
