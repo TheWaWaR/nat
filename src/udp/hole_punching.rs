@@ -165,7 +165,11 @@ impl HolePunching {
         };
         match self.socket {
             Some(ref socket) => {
-                debug!("Received {} bytes from {:?}", bytes.len(), socket.remote_addr());
+                debug!(
+                    "Received {} bytes from {:?}",
+                    bytes.len(),
+                    socket.remote_addr()
+                );
             }
             None => {}
         }
@@ -230,6 +234,10 @@ impl HolePunching {
                 ref mut ack_acks_sent,
                 received_ack_ack,
             } => {
+                debug!(
+                    ">> ack_acks_sent = {} && received_ack_ack = {}",
+                    ack_acks_sent, received_ack_ack
+                );
                 if *ack_acks_sent >= 5 && received_ack_ack {
                     return Ok(Async::Ready(self.socket.take().unwrap()));
                 }
@@ -252,11 +260,33 @@ impl HolePunching {
                         .set_ttl(SANE_DEFAULT_TTL)
                         .map_err(|_| RendezvousError::Any(format!("SetTtl")))?;
                     self.timeout.reset(Instant::now());
+                    if let Some(ref socket) = self.socket {
+                        trace!(
+                            "[phase = Syn]: Received HolePunchMsg::Syn from {:?} by {:?}",
+                            socket.remote_addr(),
+                            socket.local_addr(),
+                        );
+                    }
                 }
                 HolePunchingPhase::Ack => {
                     self.timeout.reset(Instant::now());
+                    if let Some(ref socket) = self.socket {
+                        trace!(
+                            "[phase = Ack]: Received HolePunchMsg::Syn from {:?} by {:?}",
+                            socket.remote_addr(),
+                            socket.local_addr(),
+                        );
+                    }
                 }
-                HolePunchingPhase::AckAck { .. } => (),
+                HolePunchingPhase::AckAck { .. } => {
+                    if let Some(ref socket) = self.socket {
+                        trace!(
+                            "[phase = AckAck]: Received HolePunchMsg::Syn from {:?} by {:?}",
+                            socket.remote_addr(),
+                            socket.local_addr(),
+                        );
+                    }
+                }
             },
             HolePunchMsg::Ack => match self.phase {
                 HolePunchingPhase::Syn { .. } | HolePunchingPhase::Ack => {
@@ -265,9 +295,23 @@ impl HolePunching {
                         received_ack_ack: false,
                     };
                     self.timeout.reset(Instant::now());
+                    if let Some(ref socket) = self.socket {
+                        trace!(
+                            "[phase = Syn/Ack]: Received HolePunchMsg::Ack from {:?} by {:?}",
+                            socket.remote_addr(),
+                            socket.local_addr(),
+                        );
+                    }
                 }
                 HolePunchingPhase::AckAck { .. } => {
                     self.timeout.reset(Instant::now());
+                    if let Some(ref socket) = self.socket {
+                        trace!(
+                            "[phase = AckAck]: Received HolePunchMsg::Ack from {:?} by {:?}",
+                            socket.remote_addr(),
+                            socket.local_addr(),
+                        );
+                    }
                 }
             },
             HolePunchMsg::AckAck => match self.phase {
@@ -280,11 +324,25 @@ impl HolePunching {
                         received_ack_ack: true,
                     };
                     self.timeout.reset(Instant::now());
+                    if let Some(ref socket) = self.socket {
+                        trace!(
+                            "[phase = Ack]: Received HolePunchMsg::AckAck from {:?} by {:?}",
+                            socket.remote_addr(),
+                            socket.local_addr(),
+                        );
+                    }
                 }
                 HolePunchingPhase::AckAck {
                     ref mut received_ack_ack,
                     ..
                 } => {
+                    if let Some(ref socket) = self.socket {
+                        trace!(
+                            "[phase = AckAck]: Received HolePunchMsg::AckAck from {:?} by {:?}",
+                            socket.remote_addr(),
+                            socket.local_addr(),
+                        );
+                    }
                     *received_ack_ack = true;
                 }
             },
@@ -293,7 +351,14 @@ impl HolePunching {
                     return Err(RendezvousError::Any(format!("UnexpectedMessage")));
                 }
                 HolePunchingPhase::Ack | HolePunchingPhase::AckAck { .. } => {
-                    return Ok(Async::Ready(self.socket.take().unwrap()))
+                    if let Some(ref socket) = self.socket {
+                        trace!(
+                            "[phase = Ack/AckAck]: Received HolePunchMsg::Choose from {:?} by {:?}",
+                            socket.remote_addr(),
+                            socket.local_addr(),
+                        );
+                    }
+                    return Ok(Async::Ready(self.socket.take().unwrap()));
                 }
             },
         }
@@ -323,6 +388,7 @@ impl Future for HolePunching {
                 Async::NotReady => return Ok(Async::NotReady),
                 Async::Ready(msg) => {
                     if let Async::Ready(socket) = self.process_msg(&msg)? {
+                        debug!(">> A socket been chosen: {:?}", socket.local_addr());
                         return Ok(Async::Ready((socket, true)));
                     }
                 }
@@ -454,11 +520,22 @@ fn take_choose(
                 .map_err(|(err, _)| map_error(err))
                 .and_then(move |(bytes_opt, with_addr)| {
                     if let Some(bytes) = bytes_opt {
+                        debug!(
+                            "Received {} bytes from {:?} by {:?}",
+                            bytes.len(),
+                            with_addr.remote_addr(),
+                            with_addr.local_addr(),
+                        );
                         data.put(bytes);
                     }
 
                     if data.len() >= 2 {
                         let content_len = LittleEndian::read_u16(&data[0..2]) as usize;
+                        debug!(
+                            "content.length = {}, data.length = {}",
+                            content_len,
+                            data.len()
+                        );
                         if data.len() >= content_len + 2 {
                             let content = data.split_to(content_len + 2);
                             let result: Result<

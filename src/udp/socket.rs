@@ -214,7 +214,8 @@ impl UdpSocketExt for UdpSocket {
                     Box::new(fut) as BoxFuture<_, _>
                 }
                 Err(err) => {
-                    println!("public bind failed: {:?}", err);
+                    let sockets_number = 3;
+                    debug!("public bind failed: {:?}", err);
                     let listen_socket =
                         UdpSocket::bind_reusable(&listen_addr, &handle0, None).unwrap();
                     let handle01 = handle0.clone();
@@ -231,7 +232,8 @@ impl UdpSocketExt for UdpSocket {
                             move |result| match result {
                                 Ok(addr) => {
                                     debug!(
-                                        "open a socket for hole punching: rendezvous_addr={:?}",
+                                        "open a socket for hole punching: bind_addr={:?}, rendezvous_addr={:?}",
+                                        bind_addr,
                                         addr
                                     );
                                     sockets.push((socket, addr));
@@ -251,7 +253,10 @@ impl UdpSocketExt for UdpSocket {
                             Vec<(UdpSocket, SocketAddr)>,
                             Option<RendezvousError>,
                         )| {
-                            debug!("Finish open 6 sockets for hole punching: {:?}", err_opt);
+                            debug!(
+                                "Finish open {} sockets for hole punching: {:?}",
+                                sockets_number, err_opt
+                            );
                             let (sockets, rendezvous_addrs) =
                                 sockets.into_iter().unzip::<_, _, Vec<_>, _>();
                             let open_addrs = listen_socket.expanded_local_addrs().unwrap();
@@ -266,13 +271,13 @@ impl UdpSocketExt for UdpSocket {
                                 rendezvous_addrs,
                             };
                             exchange_msg(channel, &msg).and_then(move |their_msg| {
+                                debug!("Got their msg: {:#?}", their_msg);
                                 let UdpRendezvousMsg {
                                     pubkey: their_pubkey,
                                     nonce: their_nonce,
                                     open_addrs: their_open_addrs_set,
                                     rendezvous_addrs: their_rendezvous_addrs,
                                 } = their_msg;
-                                debug!("Got their pubkey: {:?}", their_pubkey);
                                 let mut punchers = FuturesUnordered::new();
                                 for (socket, their_addr) in
                                     sockets.into_iter().zip(their_rendezvous_addrs)

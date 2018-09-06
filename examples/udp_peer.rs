@@ -1,4 +1,6 @@
 extern crate clap;
+#[macro_use]
+extern crate log;
 extern crate env_logger;
 extern crate futures;
 extern crate nat;
@@ -138,19 +140,22 @@ fn main() {
                 UdpSocket::rendezvous_connect(relay_channel, &handle, &config)
                     .map_err(|e| panic!("rendezvous connect failed: {:?}", e))
                     .and_then(|(socket, remote_addr)| {
-                        println!(
+                        info!(
                             "connected from {:?} to {:?}!",
                             socket.local_addr(),
                             remote_addr
                         );
-                        socket
-                            .send_dgram(message, remote_addr)
-                            .map_err(|e| panic!("error writing to udp socket: {}", e))
-                            .and_then(move |(socket, _)| {
-                                println!("Message sent");
-                                use std::thread;
-                                future::loop_fn(socket, move |socket| {
+                        use std::thread;
+                        future::loop_fn(socket, move |socket| {
+                            thread::sleep_ms(1800);
+                            trace!("Sending message to {:?}", remote_addr);
+                            socket
+                                .send_dgram(message.clone(), remote_addr)
+                                .map_err(|e| panic!("error writing to udp socket: {}", e))
+                                .and_then(move |(socket, _)| {
+                                    trace!("Message sent");
                                     let buffer = vec![0u8; 4 * 1024];
+                                    trace!("Receiving message from: {:?}", remote_addr);
                                     socket
                                         .recv_dgram(buffer)
                                         .map_err(|e| panic!("error receiving on udp socket: {}", e))
@@ -158,14 +163,13 @@ fn main() {
                                             if recv_addr == remote_addr {
                                                 let recv_message =
                                                     String::from_utf8_lossy(&buffer[..len]);
-                                                println!("got message: {}", recv_message);
-                                                thread::sleep_ms(200);
+                                                info!("got message: {}", recv_message);
                                             }
                                             let result: Loop<(), _> = Loop::Continue(socket);
                                             result
                                         })
                                 })
-                            })
+                        })
                     })
             });
     core.run(fut).unwrap();
